@@ -24,11 +24,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY requirements.txt ./
 # Large CPU wheel: curl retries instead of pip's short HTTPS read timeout.
+# Filename must keep the PEP 427 tags or pip rejects the file.
 ARG TORCH_WHL=https://download.pytorch.org/whl/cpu/torch-2.14.1%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
+ARG TORCH_FILE=torch-2.14.1+cpu-cp312-cp312-manylinux_2_28_x86_64.whl
 RUN curl -fL --retry 12 --retry-all-errors --retry-delay 5 --connect-timeout 30 \
-      -o /tmp/torch.whl "$TORCH_WHL" \
-    && pip install --no-cache-dir --timeout 300 /tmp/torch.whl \
-    && rm -f /tmp/torch.whl
+      -o "/tmp/${TORCH_FILE}" "$TORCH_WHL"
+RUN pip install --no-cache-dir --timeout 300 "/tmp/${TORCH_FILE}" \
+    && rm -f "/tmp/${TORCH_FILE}"
 RUN pip install --no-cache-dir --retries 10 --timeout 300 -r requirements.txt
 RUN python -c "import whisper; whisper.load_model('base')"
 
