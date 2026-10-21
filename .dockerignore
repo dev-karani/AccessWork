@@ -1,0 +1,14 @@
+.git
+.gitignore
+node_modules
+dist
+server/.piper-venv
+server/voices
+server/__pycache__
+**/__pycache__
+**/*.pptx
+**/*.pyc
+.cursor
+agent-transcripts
+*.log
+docker-compose.override.yml
