@@ -1,54 +1,51 @@
-import { useCallback, useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Avatar } from './avatar/Avatar'
 import { Avatar3D } from './avatar/Avatar3D'
+import { signingAvailability, signingStageCopy, tokenKind, tokenKindLabel } from './avatar/signingAvailability'
 import { useSigner } from './avatar/useSigner'
 import { PHRASE_GROUPS, SAMPLE_GUEST_LINES } from './phrases'
-import { makeVoiceNote, playVoice, useServerHealth, useWhisperListener, type ServerHealth } from './speech'
+import { formatTime, ROLE_LABEL, type From, type Message, type Via } from './session/types'
+import { makeVoiceNote, playVoice, useServerHealth, useWhisperListener, userFacingSpeechError, type ServerHealth } from './speech'
+import { TaughtSignsPanel } from './ui/TaughtSignsPanel'
+import { CameraControl, VideoPreview, type CameraSetting } from './ui/media'
 import { useCamera, useCameraDevices } from './vision/camera'
-import { SignCamera } from './vision/SignCamera'
-import {
-  confidence,
-  loadTemplates,
-  saveTemplates,
-  type Match,
-  type Sequence,
-  type SignTemplate,
-} from './vision/signRecognizer'
 import './App.css'
 
-type From = 'guest' | 'employee'
-type Via = 'spoken' | 'typed' | 'phrase' | 'signed'
-interface Message {
-  id: number
-  from: From
-  text: string
-  at: Date
-  via: Via
-  voiceUrl?: string | null
-  voice?: 'making' | 'ready' | 'none'
-}
-type View = 'both' | 'employee' | 'guest'
 type AvatarStyle = '3d' | 'cartoon'
+type View = 'both' | 'employee' | 'guest'
 
-interface CameraSetting {
-  on: boolean
-  deviceId: string | undefined
-}
-
-const time = (d: Date) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-const VIA_LABEL: Record<Via, string> = { spoken: 'spoken', typed: 'typed', phrase: 'quick phrase', signed: 'signed' }
+type SessionPhase =
+  | 'idle'
+  | 'listening'
+  | 'transcribing'
+  | 'playing'
+  | 'speaking'
+  | 'permission-denied'
+  | 'offline'
+  | 'ending'
 
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [view, setView] = useState<View>('both')
+  const [speaker, setSpeaker] = useState<From>('guest')
   const [alerting, setAlerting] = useState(false)
   const [speaking, setSpeaking] = useState(false)
+  const [ending, setEnding] = useState(false)
   const [sampleIndex, setSampleIndex] = useState(0)
   const [avatarStyle, setAvatarStyle] = useState<AvatarStyle>('3d')
+  const [phraseGroup, setPhraseGroup] = useState(PHRASE_GROUPS[0].id)
   const [employeeCam, setEmployeeCam] = useState<CameraSetting>({ on: false, deviceId: undefined })
   const [guestCam, setGuestCam] = useState<CameraSetting>({ on: false, deviceId: undefined })
+  const [showPhrases, setShowPhrases] = useState(false)
+  const [sheet, setSheet] = useState<'none' | 'settings' | 'camera'>('none')
+  const [draft, setDraft] = useState('')
+  const [showEmoji, setShowEmoji] = useState(false)
+  const [replaying, setReplaying] = useState(false)
+  const [avatarStatus, setAvatarStatus] = useState<'loading' | 'ready' | 'error'>('loading')
   const nextId = useRef(1)
   const alertTimer = useRef<number | undefined>(undefined)
+  const pendingReplay = useRef(false)
+  const me: From = view === 'guest' ? 'guest' : view === 'employee' ? 'employee' : speaker
   const signer = useSigner()
   const health = useServerHealth()
   const { devices, refresh: refreshDevices } = useCameraDevices()
@@ -69,57 +66,132 @@ export default function App() {
   }, [])
 
   const { play } = signer
-  const onGuestMessage = useCallback(
-    (text: string, via: Via = 'spoken') => {
-      addMessage({ from: 'guest', text, via })
-      flash()
-      play(text)
+
+  const sendNow = useCallback(
+    async (text: string, via: Via, from: From, recorded?: string | null) => {
+      const clean = text.trim()
+      if (!clean) return
+      const id = addMessage({ from, text: clean, via, voice: recorded ? 'ready' : 'making', voiceUrl: recorded ?? undefined })
+      if (from === 'guest') {
+        flash()
+        setReplaying(false)
+        play(clean)
+      }
+      if (!recorded) {
+        const url = await makeVoiceNote(clean)
+        setMessages((list) => list.map((m) => (m.id === id ? { ...m, voiceUrl: url, voice: url ? 'ready' : 'none' } : m)))
+      }
     },
     [addMessage, flash, play],
   )
 
-  const listener = useWhisperListener({ onFinal: onGuestMessage, onSpeechStart: flash })
-
-  const sendReply = useCallback(
-    async (text: string, via: Via) => {
-      const clean = text.trim()
-      if (!clean) return
-      const id = addMessage({ from: 'employee', text: clean, via, voice: 'making' })
-      setSpeaking(true)
-      const url = await makeVoiceNote(clean)
-      setMessages((list) => list.map((m) => (m.id === id ? { ...m, voiceUrl: url, voice: url ? 'ready' : 'none' } : m)))
-      playVoice(url, clean, () => setSpeaking(false))
+  const listener = useWhisperListener({
+    onFinal: (text, wav) => {
+      const recorded = wav ? URL.createObjectURL(wav) : null
+      void sendNow(text, 'spoken', me, recorded)
     },
-    [addMessage],
+    onSpeechStart: flash,
+  })
+
+  const sendDirect = useCallback(
+    (text: string, via: Via, from: From) => {
+      void sendNow(text, via, from)
+    },
+    [sendNow],
   )
 
-  const replay = useCallback((m: Message) => {
+  const replayVoice = useCallback((m: Message) => {
     setSpeaking(true)
     playVoice(m.voiceUrl, m.text, () => setSpeaking(false))
   }, [])
 
+  const endSession = useCallback(() => {
+    listener.stop()
+    signer.stop()
+    messages.forEach((m) => {
+      if (m.voiceUrl) URL.revokeObjectURL(m.voiceUrl)
+    })
+    setMessages([])
+    setAlerting(false)
+    setSpeaking(false)
+    setEnding(false)
+    setEmployeeCam((c) => ({ ...c, on: false }))
+    setGuestCam((c) => ({ ...c, on: false }))
+  }, [listener, messages, signer])
+
   const lastGuest = [...messages].reverse().find((m) => m.from === 'guest')
-  const lastReply = [...messages].reverse().find((m) => m.from === 'employee')
+  const focusText = lastGuest?.text ?? ''
+  const signing = useMemo(() => signingAvailability(focusText), [focusText])
+  const stageCopy = useMemo(
+    () =>
+      signingStageCopy(focusText, {
+        playing: signer.playing,
+        replaying,
+        processing: listener.transcribing || avatarStatus === 'loading',
+        error: avatarStatus === 'error',
+      }),
+    [avatarStatus, focusText, listener.transcribing, replaying, signer.playing],
+  )
+
+  useEffect(() => {
+    if (signer.playing) {
+      if (pendingReplay.current) {
+        pendingReplay.current = false
+        setReplaying(true)
+      }
+      return
+    }
+    setReplaying(false)
+  }, [signer.playing])
+
+  const replaySign = useCallback(
+    (text: string) => {
+      pendingReplay.current = true
+      setReplaying(true)
+      play(text)
+    },
+    [play],
+  )
+
+  const phase: SessionPhase = ending
+    ? 'ending'
+    : listener.error?.includes('blocked')
+      ? 'permission-denied'
+      : health.whisper === 'offline' && !listener.listening
+        ? 'offline'
+        : listener.transcribing
+          ? 'transcribing'
+          : listener.listening
+            ? 'listening'
+            : signer.playing
+              ? 'playing'
+              : speaking
+                ? 'speaking'
+                : 'idle'
+
+  const statusText = statusLabel(phase, health, listener, speaking, alerting)
+
+  useEffect(() => {
+    if (view === 'guest') setSpeaker('guest')
+    if (view === 'employee') setSpeaker('employee')
+  }, [view])
+
+  const sendTyped = () => {
+    if (!draft.trim()) return
+    sendDirect(draft, 'typed', me)
+    setDraft('')
+  }
 
   return (
-    <div className="app">
+    <div className={`app view-${view} ${alerting || listener.speaking ? 'is-alert' : ''}`}>
       <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden>
-            AW
-          </span>
-          <div>
-            <h1>AccessWork</h1>
-            <p>Front desk communication · Deaf receptionist ⇄ hearing guest</p>
-          </div>
-        </div>
-        <ServerBadge health={health} />
-        <nav className="view-switch" aria-label="Screen layout">
+        <h1 className="wordmark">access.</h1>
+        <nav className="view-switch" aria-label="Demo view">
           {(
             [
-              ['both', 'Both sides'],
-              ['employee', 'Employee screen'],
-              ['guest', 'Guest screen'],
+              ['both', 'Both'],
+              ['employee', 'Receptionist'],
+              ['guest', 'Guest'],
             ] as const
           ).map(([id, label]) => (
             <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>
@@ -127,89 +199,313 @@ export default function App() {
             </button>
           ))}
         </nav>
+        <p className="lang-pair">English · Sign</p>
+        <ServerBadge health={health} />
+        <button className="icon-btn" onClick={() => setSheet(sheet === 'settings' ? 'none' : 'settings')} aria-label="Settings">
+          <IconGear />
+        </button>
       </header>
 
-      <main className={`panels view-${view}`}>
+      <p className={`live-status phase-${phase}`} role="status" aria-live="polite">
+        {statusText}
+      </p>
+
+      <div className="toolbar">
+        <button className={showPhrases ? 'on' : ''} onClick={() => setShowPhrases((v) => !v)}>
+          <IconList /> Common phrases
+        </button>
+        <button onClick={() => setSheet(sheet === 'camera' ? 'none' : 'camera')}>
+          <IconCam /> Camera input <span className="soon">Soon</span>
+        </button>
+        <button className="end" onClick={() => setEnding(true)} disabled={messages.length === 0}>
+          End session
+        </button>
+      </div>
+
+      <main className="desk">
         {view !== 'guest' && (
-          <EmployeePanel
-            signer={signer}
-            avatarStyle={avatarStyle}
-            onAvatarStyle={setAvatarStyle}
-            alerting={alerting}
-            guestHeard={listener.speaking}
-            transcribing={listener.transcribing}
-            lastGuest={lastGuest}
-            onReply={sendReply}
-            speaking={speaking}
-            camera={employeeCam}
-            onCamera={setEmployeeCam}
-            stream={employeeStream.stream}
-            cameraError={employeeStream.error}
-            guestStream={guestStream.stream}
-            devices={devices}
-          />
+          <section className="stage" aria-label="Signing stage">
+            <div className="avatar-frame">
+              {avatarStyle === '3d' ? (
+                <Avatar3D
+                  pose={signer.pose}
+                  talking={signer.playing && signer.active >= 0}
+                  letter={signer.letter}
+                  onStatus={setAvatarStatus}
+                />
+              ) : (
+                <Avatar pose={signer.pose} talking={signer.playing && signer.active >= 0} letter={signer.letter} />
+              )}
+              <VideoPreview stream={guestStream.stream} className="guest-pip" label="Guest camera preview" />
+              <button className="expand" aria-label="Focus signer" onClick={() => setView('employee')}>
+                <IconExpand />
+              </button>
+            </div>
+            <div className="gloss-strip" aria-live="polite">
+              <div className="stage-caption">
+                <span className={`stage-status ${stageCopy.status === 'Signing' || stageCopy.status === 'Replay' ? 'live' : ''}`}>
+                  {stageCopy.status}
+                </span>
+                {stageCopy.caption && <p className="gloss-source">{stageCopy.caption}</p>}
+              </div>
+              {signer.glosses.length > 0 && (
+                <div className="gloss-chips">
+                  {signer.glosses.map((g, i) => {
+                    const kind = tokenKind(g)
+                    return (
+                      <span key={`${g.label}-${i}`} className={`gloss-chip ${i === signer.active ? 'active' : ''}`}>
+                        {g.label}
+                        <span className="kind">{tokenKindLabel(kind)}</span>
+                      </span>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+            <div className="stage-tools">
+              <button className="circle-sm" disabled={!signer.playing} onClick={signer.stop} aria-label="Stop signing">
+                <IconPause />
+              </button>
+              <span className="speed">{signer.speed.toFixed(1)}×</span>
+              <button
+                className="circle-sm"
+                disabled={!signing.demoAvailable || !focusText}
+                onClick={() => replaySign(focusText)}
+                aria-label="Replay guest line"
+              >
+                <IconReplay />
+              </button>
+            </div>
+          </section>
         )}
-        {view !== 'employee' && (
-          <GuestPanel
-            listener={listener}
-            health={health}
-            lastReply={lastReply}
-            speaking={speaking}
-            onSend={(text) => onGuestMessage(text, 'typed')}
-            onSample={() => {
-              onGuestMessage(SAMPLE_GUEST_LINES[sampleIndex], 'typed')
-              setSampleIndex((i) => (i + 1) % SAMPLE_GUEST_LINES.length)
+
+        <aside className="comms" aria-label="Conversation">
+          <header className="comms-head">
+            <div>
+              <h2>Conversation</h2>
+              <p>{ROLE_LABEL[me]}</p>
+            </div>
+          </header>
+          <ConversationLog
+            self={me}
+            messages={messages}
+            onReplaySign={(m) => {
+              if (m.from !== 'guest') return
+              replaySign(m.text)
             }}
-            nextSample={SAMPLE_GUEST_LINES[sampleIndex]}
-            onReplay={() => lastReply && replay(lastReply)}
-            camera={guestCam}
-            onCamera={setGuestCam}
-            stream={guestStream.stream}
-            cameraError={guestStream.error}
-            devices={devices}
+            onReplayVoice={replayVoice}
           />
-        )}
+          <div className="comms-dock">
+            {showPhrases && (
+              <PhrasePad
+                group={phraseGroup}
+                onGroup={setPhraseGroup}
+                onPick={(p) => {
+                  sendDirect(p, 'phrase', 'employee')
+                  setShowPhrases(false)
+                }}
+              />
+            )}
+            {showEmoji && (
+              <EmojiPad
+                onPick={(emoji) => {
+                  setDraft((d) => d + emoji)
+                  setShowEmoji(false)
+                }}
+              />
+            )}
+            <div className="from-row" aria-label="Message from">
+              <span>Message from</span>
+              {view === 'both' ? (
+                <div className="view-switch">
+                  <button className={speaker === 'guest' ? 'active' : ''} onClick={() => setSpeaker('guest')}>
+                    Guest
+                  </button>
+                  <button className={speaker === 'employee' ? 'active' : ''} onClick={() => setSpeaker('employee')}>
+                    Receptionist
+                  </button>
+                </div>
+              ) : (
+                <strong>{ROLE_LABEL[me]}</strong>
+              )}
+            </div>
+            {listener.listening ? (
+              <RecMeter level={listener.level} speaking={listener.speaking} onStop={listener.stop} />
+            ) : (
+              <div className="composer">
+                <button
+                  className={`composer-icon ${showPhrases ? 'on' : ''}`}
+                  onClick={() => {
+                    setShowEmoji(false)
+                    setShowPhrases((v) => !v)
+                  }}
+                  aria-label="Common phrases"
+                  aria-expanded={showPhrases}
+                >
+                  <IconList />
+                </button>
+                <button
+                  className={`composer-icon ${showEmoji ? 'on' : ''}`}
+                  onClick={() => {
+                    setShowPhrases(false)
+                    setShowEmoji((v) => !v)
+                  }}
+                  aria-label="Emoji"
+                  aria-expanded={showEmoji}
+                >
+                  <IconEmoji />
+                </button>
+                <button
+                  className="composer-icon"
+                  onClick={() => void listener.start()}
+                  disabled={health.whisper !== 'ready'}
+                  aria-label="Voice message"
+                >
+                  <IconMic />
+                </button>
+                <input
+                  className="composer-input"
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  placeholder={listener.transcribing ? 'Writing speech down…' : 'Type a message'}
+                  aria-label="Message"
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') sendTyped()
+                  }}
+                />
+                <button className="composer-send" onClick={sendTyped} disabled={!draft.trim()} aria-label="Send">
+                  <IconSend />
+                </button>
+              </div>
+            )}
+            {listener.error && (
+              <>
+                <p className="warn">{userFacingSpeechError(listener.error)}</p>
+                <div className="mic-recover">
+                  <button type="button" onClick={() => void listener.start()} disabled={health.whisper !== 'ready'}>
+                    Try again
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </aside>
       </main>
 
-      <section className="log" aria-label="Conversation">
-        <div className="log-head">
-          <h2>Conversation</h2>
-          {messages.length > 0 && (
-            <button className="ghost" onClick={() => setMessages([])}>
-              Clear
+      {sheet === 'settings' && (
+        <div className="sheet" role="dialog" aria-label="Settings">
+          <div className="sheet-card">
+            <header>
+              <h2>Languages</h2>
+              <button onClick={() => setSheet('none')} aria-label="Close">
+                ×
+              </button>
+            </header>
+            <p className="muted">Spoken language (input)</p>
+            <div className="setting-row">English</div>
+            <p className="swap">↕</p>
+            <p className="muted">Sign language (output)</p>
+            <div className="setting-row">Kenyan Sign Language (KSL)</div>
+            <p className="note">KSL here means Kenyan Sign Language, not Korean.</p>
+            <p className="muted">Avatar</p>
+            <div className="view-switch">
+              <button className={avatarStyle === '3d' ? 'active' : ''} onClick={() => setAvatarStyle('3d')}>
+                3D
+              </button>
+              <button className={avatarStyle === 'cartoon' ? 'active' : ''} onClick={() => setAvatarStyle('cartoon')}>
+                Cartoon
+              </button>
+            </div>
+            <label className="speed-row">
+              Sign speed
+              <select value={signer.speed} onChange={(e) => signer.setSpeed(Number(e.target.value))}>
+                <option value={0.6}>0.6×</option>
+                <option value={1}>1.0×</option>
+                <option value={1.4}>1.4×</option>
+              </select>
+            </label>
+            <button
+              className="text-btn"
+              onClick={() => {
+                sendDirect(SAMPLE_GUEST_LINES[sampleIndex], 'typed', 'guest')
+                setSampleIndex((i) => (i + 1) % SAMPLE_GUEST_LINES.length)
+                setSheet('none')
+              }}
+            >
+              Send demo guest line
             </button>
-          )}
+          </div>
         </div>
-        {messages.length === 0 ? (
-          <p className="empty">The exchange between the guest and the receptionist will appear here.</p>
-        ) : (
-          <ol>
-            {messages.map((m) => (
-              <li key={m.id} className={`bubble ${m.from}`}>
-                <span className="who">
-                  {m.from === 'guest' ? 'Guest' : 'Receptionist'} ({VIA_LABEL[m.via]}) · {time(m.at)}
-                </span>
-                <span className="text">{m.text}</span>
-                {m.from === 'guest' ? (
-                  <button className="link" onClick={() => signer.play(m.text)}>
-                    Sign again
-                  </button>
-                ) : m.voice === 'making' ? (
-                  <span className="note-state">Making voice note…</span>
-                ) : m.voiceUrl ? (
-                  <audio controls src={m.voiceUrl} className="voice-note" />
-                ) : (
-                  <button className="link" onClick={() => replay(m)}>
-                    Play aloud
-                  </button>
-                )}
-              </li>
-            ))}
-          </ol>
-        )}
-      </section>
+      )}
+
+      {sheet === 'camera' && (
+        <div className="sheet" role="dialog" aria-label="Camera input">
+          <div className="sheet-card">
+            <header>
+              <h2>Sign to camera</h2>
+              <button onClick={() => setSheet('none')} aria-label="Close">
+                ×
+              </button>
+            </header>
+            <div className="soon-hero">
+              <span className="soon">Soon</span>
+              <p>We’re working on live sign-language interpretation.</p>
+            </div>
+            <TaughtSignsPanel
+              camera={employeeCam}
+              onCamera={setEmployeeCam}
+              stream={employeeStream.stream}
+              cameraError={employeeStream.error}
+              devices={devices}
+              group={phraseGroup}
+              onSend={(text) => {
+                sendDirect(text, 'signed', 'employee')
+                setSheet('none')
+              }}
+            />
+            <div className="guest-camera">
+              <CameraControl label="guest camera" camera={guestCam} onCamera={setGuestCam} devices={devices} />
+              {guestStream.error && <p className="warn">{guestStream.error}</p>}
+              <VideoPreview stream={guestStream.stream} className="guest-video" label="Guest camera preview" />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {ending && (
+        <dialog className="end-dialog" open aria-labelledby="end-title">
+          <h2 id="end-title">End this session?</h2>
+          <p>This clears the conversation on this screen. Taught signs stay on the device.</p>
+          <div className="end-actions">
+            <button className="fill-danger" onClick={endSession}>
+              End and clear
+            </button>
+            <button onClick={() => setEnding(false)}>Keep talking</button>
+          </div>
+        </dialog>
+      )}
     </div>
   )
+}
+
+function statusLabel(
+  phase: SessionPhase,
+  health: ServerHealth,
+  listener: ReturnType<typeof useWhisperListener>,
+  speaking: boolean,
+  alerting: boolean,
+) {
+  if (phase === 'ending') return 'Ending session…'
+  if (phase === 'permission-denied') return userFacingSpeechError(listener.error)
+  if (phase === 'offline') return 'Speech is offline. You can type.'
+  if (listener.speaking) return 'Hearing speech…'
+  if (phase === 'transcribing') return 'Writing speech down…'
+  if (phase === 'listening') return 'Listening'
+  if (phase === 'playing') return 'Signing'
+  if (speaking) return 'Playing voice note'
+  if (alerting) return 'New speech'
+  if (health.whisper === 'loading') return 'Loading speech…'
+  return 'Ready'
 }
 
 function ServerBadge({ health }: { health: ServerHealth }) {
@@ -220,7 +516,7 @@ function ServerBadge({ health }: { health: ServerHealth }) {
         ? 'Local Whisper loading…'
         : health.whisper === 'error'
           ? 'Whisper failed to load'
-          : 'Speech server offline: run npm run server'
+          : 'Speech server offline'
   return (
     <span className={`server-badge ${health.whisper}`} title={health.error ?? undefined}>
       <span className="dot" aria-hidden /> {label}
@@ -228,524 +524,194 @@ function ServerBadge({ health }: { health: ServerHealth }) {
   )
 }
 
-interface CameraControlProps {
-  label: string
-  camera: CameraSetting
-  onCamera: (c: CameraSetting) => void
-  devices: MediaDeviceInfo[]
-}
-
-function CameraControl({ label, camera, onCamera, devices }: CameraControlProps) {
-  return (
-    <div className="camera-control">
-      <button className={camera.on ? 'active' : ''} onClick={() => onCamera({ ...camera, on: !camera.on })} aria-pressed={camera.on}>
-        {camera.on ? `■ Turn off ${label}` : `📷 Turn on ${label}`}
-      </button>
-      {devices.length > 1 && (
-        <select
-          aria-label={`Choose ${label}`}
-          value={camera.deviceId ?? ''}
-          onChange={(e) => onCamera({ ...camera, deviceId: e.target.value || undefined })}
-        >
-          <option value="">Default camera</option>
-          {devices.map((d, i) => (
-            <option key={d.deviceId || i} value={d.deviceId}>
-              {d.label || `Camera ${i + 1}`}
-            </option>
-          ))}
-        </select>
-      )}
-    </div>
-  )
-}
-
-function VideoPreview({ stream, className, label }: { stream: MediaStream | null; className?: string; label: string }) {
-  const ref = useRef<HTMLVideoElement>(null)
-  useEffect(() => {
-    if (!ref.current) return
-    ref.current.srcObject = stream
-    if (stream) ref.current.play().catch(() => {})
-  }, [stream])
-  if (!stream) return null
-  return <video ref={ref} className={className} muted playsInline autoPlay aria-label={label} />
-}
-
-type Signer = ReturnType<typeof useSigner>
-
-interface EmployeeProps {
-  signer: Signer
-  avatarStyle: AvatarStyle
-  onAvatarStyle: (s: AvatarStyle) => void
-  alerting: boolean
-  guestHeard: boolean
-  transcribing: boolean
-  lastGuest?: Message
-  onReply: (text: string, via: Via) => void
-  speaking: boolean
-  camera: CameraSetting
-  onCamera: (c: CameraSetting) => void
-  stream: MediaStream | null
-  cameraError: string | null
-  guestStream: MediaStream | null
-  devices: MediaDeviceInfo[]
-}
-
-function EmployeePanel(props: EmployeeProps) {
-  const { signer, avatarStyle, alerting, guestHeard, transcribing, lastGuest, onReply, speaking } = props
-  const [draft, setDraft] = useState('')
-  const [group, setGroup] = useState(PHRASE_GROUPS[0].id)
-  const phrases = PHRASE_GROUPS.find((g) => g.id === group)?.phrases ?? []
-
-  const submit = (e: FormEvent) => {
-    e.preventDefault()
-    onReply(draft, 'typed')
-    setDraft('')
-  }
-
-  const alertText = guestHeard
-    ? 'Guest is speaking…'
-    : transcribing
-      ? 'Writing down what the guest said…'
-      : alerting
-        ? 'New message from the guest'
-        : 'Waiting for the guest'
-
-  return (
-    <section className={`panel employee ${alerting || guestHeard ? 'alerting' : ''}`} aria-label="Employee screen">
-      <div className="panel-head">
-        <span className="tag tag-employee">Employee screen</span>
-        <h2>Deaf receptionist</h2>
-      </div>
-
-      <div className={`alert ${alerting || guestHeard || transcribing ? 'on' : ''}`} role="status" aria-live="polite">
-        <span className="dot" aria-hidden />
-        {alertText}
-      </div>
-
-      <div className="avatar-card">
-        <div className="avatar-stage">
-          {avatarStyle === '3d' ? (
-            <Avatar3D pose={signer.pose} talking={signer.playing && signer.active >= 0} letter={signer.letter} />
-          ) : (
-            <Avatar pose={signer.pose} talking={signer.playing && signer.active >= 0} letter={signer.letter} />
-          )}
-          <VideoPreview stream={props.guestStream} className="guest-pip" label="Guest camera" />
-          <div className="style-switch" role="group" aria-label="Avatar style">
-            <button className={avatarStyle === '3d' ? 'active' : ''} onClick={() => props.onAvatarStyle('3d')}>
-              3D
-            </button>
-            <button className={avatarStyle === 'cartoon' ? 'active' : ''} onClick={() => props.onAvatarStyle('cartoon')}>
-              Cartoon
-            </button>
-          </div>
-        </div>
-        <div className="avatar-side">
-          <div className="gloss" aria-label="Signed words">
-            {signer.glosses.length === 0 ? (
-              <span className="gloss-empty">Zuri signs what the guest says.</span>
-            ) : (
-              signer.glosses.map((g, i) => (
-                <span
-                  key={i}
-                  className={`chip ${g.spelled ? 'spelled' : ''} ${i === signer.active ? 'active' : ''} ${
-                    signer.active > i || (!signer.playing && signer.active === -1) ? 'done' : ''
-                  }`}
-                >
-                  {g.label}
-                </span>
-              ))
-            )}
-          </div>
-          <div className="guest-said">
-            <span className="label">Guest said</span>
-            <p className="big">{lastGuest ? lastGuest.text : '—'}</p>
-          </div>
-          <div className="avatar-controls">
-            <button disabled={!lastGuest} onClick={() => lastGuest && signer.play(lastGuest.text)}>
-              ↻ Sign again
-            </button>
-            <button disabled={!signer.playing} onClick={signer.stop}>
-              ■ Stop
-            </button>
-            <label>
-              Speed
-              <select value={signer.speed} onChange={(e) => signer.setSpeed(Number(e.target.value))}>
-                <option value={0.6}>Slow</option>
-                <option value={1}>Normal</option>
-                <option value={1.4}>Fast</option>
-              </select>
-            </label>
-          </div>
-          <p className="note">
-            Demo signs: Zuri’s movements are placeholders. Signs checked by Deaf KSL signers will replace
-            them. Words without a sign are fingerspelled.
-          </p>
-        </div>
-      </div>
-
-      <div className="reply">
-        <div className="reply-head">
-          <h3>Reply to guest</h3>
-          {speaking && <span className="speaking">🔊 Speaking to guest…</span>}
-        </div>
-
-        <SignReply
-          camera={props.camera}
-          onCamera={props.onCamera}
-          stream={props.stream}
-          cameraError={props.cameraError}
-          devices={props.devices}
-          group={group}
-          onSend={(text) => onReply(text, 'signed')}
-        />
-
-        <div className="group-tabs" role="tablist">
-          {PHRASE_GROUPS.map((g) => (
-            <button
-              key={g.id}
-              role="tab"
-              aria-selected={g.id === group}
-              className={g.id === group ? 'active' : ''}
-              onClick={() => setGroup(g.id)}
-            >
-              {g.label}
-            </button>
-          ))}
-        </div>
-        <div className="phrases">
-          {phrases.map((p) => (
-            <button key={p} className="phrase" onClick={() => onReply(p, 'phrase')}>
-              {p}
-            </button>
-          ))}
-        </div>
-        <form className="composer" onSubmit={submit}>
-          <input
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder="Type a reply. It is sent as text and a voice note."
-            aria-label="Type a reply"
-          />
-          <button type="submit" className="primary" disabled={!draft.trim()}>
-            Send
-          </button>
-        </form>
-      </div>
-    </section>
-  )
-}
-
-interface SignReplyProps {
-  camera: CameraSetting
-  onCamera: (c: CameraSetting) => void
-  stream: MediaStream | null
-  cameraError: string | null
-  devices: MediaDeviceInfo[]
+function PhrasePad({
+  group,
+  onGroup,
+  onPick,
+}: {
   group: string
-  onSend: (text: string) => void
-}
-
-const MAX_SAMPLES = 8
-
-/** Reply by signing to the camera, with a confirm step, plus the trainer for teaching phrases. */
-function SignReply({ camera, onCamera, stream, cameraError, devices, group, onSend }: SignReplyProps) {
-  const [templates, setTemplates] = useState<SignTemplate[]>(loadTemplates)
-  const [matches, setMatches] = useState<Match[] | null>(null)
-  const [trainPhrase, setTrainPhrase] = useState<string | null>(null)
-  const [trainNote, setTrainNote] = useState<string | null>(null)
-  const [showTrainer, setShowTrainer] = useState(false)
-  const [custom, setCustom] = useState('')
-  const importRef = useRef<HTMLInputElement>(null)
-
-  const updateTemplates = useCallback((next: SignTemplate[]) => {
-    setTemplates(next)
-    saveTemplates(next)
-  }, [])
-
-  const onTrained = useCallback(
-    (phrase: string, seq: Sequence | null) => {
-      setTrainPhrase(null)
-      if (!seq) {
-        setTrainNote(`No hands were seen for “${phrase}”. Try again with your hands in view.`)
-        return
-      }
-      const existing = templates.find((t) => t.phrase === phrase)
-      const next = existing
-        ? templates.map((t) => (t.phrase === phrase ? { ...t, samples: [...t.samples, seq].slice(-MAX_SAMPLES) } : t))
-        : [...templates, { phrase, samples: [seq] }]
-      updateTemplates(next)
-      const count = (existing?.samples.length ?? 0) + 1
-      setTrainNote(`Saved sample ${Math.min(count, MAX_SAMPLES)} for “${phrase}”. ${count < 3 ? 'Record 3 or more for better accuracy.' : ''}`)
-    },
-    [templates, updateTemplates],
-  )
-
-  const onRecognized = useCallback((m: Match[]) => setMatches(m.slice(0, 3)), [])
-
-  const groupPhrases = PHRASE_GROUPS.find((g) => g.id === group)?.phrases ?? []
-  const known = new Set(PHRASE_GROUPS.flatMap((g) => g.phrases))
-  const customPhrases = templates.map((t) => t.phrase).filter((p) => !known.has(p))
-  const trainList = [...groupPhrases, ...customPhrases]
-  const samplesFor = (p: string) => templates.find((t) => t.phrase === p)?.samples.length ?? 0
-  const trainedCount = templates.filter((t) => t.samples.length > 0).length
-
-  const exportTemplates = () => {
-    const blob = new Blob([JSON.stringify(templates)], { type: 'application/json' })
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = 'accesswork-signs.json'
-    a.click()
-    URL.revokeObjectURL(a.href)
-  }
-
-  const importTemplates = async (e: ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    try {
-      const data = JSON.parse(await file.text()) as SignTemplate[]
-      if (!Array.isArray(data)) throw new Error('bad file')
-      updateTemplates(data)
-      setTrainNote(`Imported ${data.length} phrases.`)
-    } catch {
-      setTrainNote('That file is not an AccessWork sign file.')
-    }
-    e.target.value = ''
-  }
-
-  const best = matches?.[0]
-  const level = matches ? confidence(matches) : 'low'
-
+  onGroup: (id: string) => void
+  onPick: (phrase: string) => void
+}) {
+  const phrases = PHRASE_GROUPS.find((g) => g.id === group)?.phrases ?? []
   return (
-    <div className="sign-reply">
-      <div className="sign-reply-head">
-        <strong>Sign to the camera</strong>
-        <CameraControl label="my camera" camera={camera} onCamera={onCamera} devices={devices} />
-      </div>
-      {cameraError && <p className="warn">{cameraError}</p>}
-
-      {camera.on && (
-        <div className="sign-grid">
-          <SignCamera
-            stream={stream}
-            templates={templates}
-            trainPhrase={trainPhrase}
-            onTrained={onTrained}
-            onRecognized={onRecognized}
-          />
-          <div className="sign-result">
-            {best ? (
-              <>
-                <span className="label">You signed</span>
-                <p className="big">{best.phrase}</p>
-                <span className={`confidence ${level}`}>
-                  {level === 'high' ? 'Strong match' : level === 'medium' ? 'Possible match' : 'Unsure, check before sending'}
-                </span>
-                <div className="sign-actions">
-                  <button
-                    className="primary"
-                    onClick={() => {
-                      onSend(best.phrase)
-                      setMatches(null)
-                    }}
-                  >
-                    ✓ Send to guest
-                  </button>
-                  <button onClick={() => setMatches(null)}>✗ Not this</button>
-                </div>
-                {matches!.length > 1 && (
-                  <div className="alternatives">
-                    <span className="label">Or did you mean</span>
-                    {matches!.slice(1).map((m) => (
-                      <button
-                        key={m.phrase}
-                        className="phrase"
-                        onClick={() => {
-                          onSend(m.phrase)
-                          setMatches(null)
-                        }}
-                      >
-                        {m.phrase}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </>
-            ) : (
-              <p className="muted">
-                {trainedCount === 0
-                  ? 'Zuri does not know your signs yet. Open “Teach my signs” and record each phrase in KSL.'
-                  : `Sign one of your ${trainedCount} taught phrases, then lower your hands. You confirm before anything is sent.`}
-              </p>
-            )}
-          </div>
-        </div>
-      )}
-
-      <button className="link trainer-toggle" onClick={() => setShowTrainer((s) => !s)}>
-        {showTrainer ? '▾' : '▸'} Teach my signs ({trainedCount} phrases taught)
-      </button>
-      {showTrainer && (
-        <div className="trainer">
-          <p className="note">
-            Record yourself signing each phrase in KSL, 3 to 5 times. After a 3-second countdown, sign the phrase
-            once. Recordings stay on this device. Uses the phrase group selected below.
-          </p>
-          {!camera.on && <p className="warn">Turn on your camera to record signs.</p>}
-          {trainNote && <p className="train-note">{trainNote}</p>}
-          <ul>
-            {trainList.map((p) => (
-              <li key={p}>
-                <span className="train-phrase">{p}</span>
-                <span className={`samples ${samplesFor(p) >= 3 ? 'ok' : ''}`}>{samplesFor(p)} samples</span>
-                <button disabled={!camera.on || !stream || trainPhrase !== null} onClick={() => setTrainPhrase(p)}>
-                  {trainPhrase === p ? 'Recording…' : '● Record'}
-                </button>
-                <button
-                  className="ghost"
-                  disabled={samplesFor(p) === 0}
-                  onClick={() => updateTemplates(templates.filter((t) => t.phrase !== p))}
-                >
-                  Clear
-                </button>
-              </li>
-            ))}
-          </ul>
-          <form
-            className="composer"
-            onSubmit={(e) => {
-              e.preventDefault()
-              const p = custom.trim()
-              if (!p || !camera.on || trainPhrase) return
-              setTrainPhrase(p)
-              setCustom('')
-            }}
+    <div className="phrase-pad">
+      <div className="group-tabs" role="tablist" aria-label="Quick phrases">
+        {PHRASE_GROUPS.map((g) => (
+          <button
+            key={g.id}
+            role="tab"
+            aria-selected={g.id === group}
+            className={g.id === group ? 'active' : ''}
+            onClick={() => onGroup(g.id)}
           >
-            <input value={custom} onChange={(e) => setCustom(e.target.value)} placeholder="Add your own phrase to teach" />
-            <button type="submit" disabled={!custom.trim() || !camera.on}>
-              ● Record
-            </button>
-          </form>
-          <div className="trainer-io">
-            <button className="ghost" disabled={templates.length === 0} onClick={exportTemplates}>
-              Export signs
-            </button>
-            <button className="ghost" onClick={() => importRef.current?.click()}>
-              Import signs
-            </button>
-            <input ref={importRef} type="file" accept="application/json" hidden onChange={importTemplates} />
-          </div>
-        </div>
-      )}
+            {g.label}
+          </button>
+        ))}
+      </div>
+      <div className="phrases">
+        {phrases.map((p) => (
+          <button key={p} className="phrase" onClick={() => onPick(p)}>
+            {p}
+          </button>
+        ))}
+      </div>
     </div>
   )
 }
 
-interface GuestProps {
-  listener: ReturnType<typeof useWhisperListener>
-  health: ServerHealth
-  lastReply?: Message
-  speaking: boolean
-  onSend: (text: string) => void
-  onSample: () => void
-  nextSample: string
-  onReplay: () => void
-  camera: CameraSetting
-  onCamera: (c: CameraSetting) => void
-  stream: MediaStream | null
-  cameraError: string | null
-  devices: MediaDeviceInfo[]
+function RecMeter({ level, speaking, onStop }: { level: number; speaking: boolean; onStop: () => void }) {
+  const [sec, setSec] = useState(0)
+  useEffect(() => {
+    const t = window.setInterval(() => setSec((n) => n + 1), 1000)
+    return () => window.clearInterval(t)
+  }, [])
+  return (
+    <div className={`rec-meter ${speaking ? 'hot' : ''}`} role="status" aria-label="Recording">
+      <button type="button" className="composer-icon live" onClick={onStop} aria-label="Stop recording">
+        <IconMic />
+      </button>
+      <div className="rec-wave" aria-hidden>
+        {Array.from({ length: 28 }, (_, i) => {
+          const pulse = Math.abs(Math.sin(i * 0.55 + level * 9))
+          const h = 0.18 + pulse * (0.22 + level * 0.6)
+          return <span key={i} style={{ height: `${Math.round(h * 100)}%` }} />
+        })}
+      </div>
+      <span className="rec-time">
+        0:{String(Math.min(sec, 59)).padStart(2, '0')}
+      </span>
+    </div>
+  )
 }
 
-function GuestPanel({ listener, health, lastReply, speaking, onSend, onSample, nextSample, onReplay, ...cam }: GuestProps) {
-  const [typed, setTyped] = useState('')
+const EMOJIS = ['😀', '😂', '😊', '😍', '🙌', '👍', '👋', '🙏', '❤️', '🔥', '✅', '❗', '🏨', '🛎️', '🧳', '🔑', '🛏️', '☕', '🍽️', '📍']
 
-  const submit = (e: FormEvent) => {
-    e.preventDefault()
-    if (!typed.trim()) return
-    onSend(typed.trim())
-    setTyped('')
-  }
+function EmojiPad({ onPick }: { onPick: (emoji: string) => void }) {
+  return (
+    <div className="emoji-pad" role="listbox" aria-label="Emoji">
+      {EMOJIS.map((emoji) => (
+        <button key={emoji} type="button" onClick={() => onPick(emoji)}>
+          {emoji}
+        </button>
+      ))}
+    </div>
+  )
+}
 
-  const micLabel = !listener.listening
-    ? 'Tap to speak'
-    : listener.speaking
-      ? 'Hearing you…'
-      : listener.transcribing
-        ? 'Writing it down…'
-        : 'Listening… tap to stop'
+function ConversationLog({
+  self,
+  messages,
+  onReplaySign,
+  onReplayVoice,
+}: {
+  self: From
+  messages: Message[]
+  onReplaySign: (m: Message) => void
+  onReplayVoice: (m: Message) => void
+}) {
+  const end = useRef<HTMLLIElement | null>(null)
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: 'end' })
+  }, [messages.length])
 
   return (
-    <section className="panel guest" aria-label="Guest screen">
-      <div className="panel-head">
-        <span className="tag tag-guest">Guest screen</span>
-        <h2>Hearing guest</h2>
-      </div>
-
-      <div className={`reply-card ${speaking ? 'speaking' : ''}`}>
-        <span className="label">Receptionist says</span>
-        <p className="big">{lastReply ? lastReply.text : 'Hello! Please speak, and I will reply on this screen.'}</p>
-        {lastReply && (
-          <div className="voice-row">
-            {lastReply.voice === 'making' && <span className="note-state">Making voice note…</span>}
-            {lastReply.voiceUrl && <audio controls src={lastReply.voiceUrl} className="voice-note" />}
-            <button className="ghost" onClick={onReplay}>
-              🔊 Play again
-            </button>
-            {lastReply.voiceUrl && (
-              <a className="link" href={lastReply.voiceUrl} download={`reply-${lastReply.id}.wav`}>
-                Download voice note
-              </a>
+    <ol className="log">
+      {messages.length > 0 && <li className="day-chip">Today</li>}
+      {messages.map((m) => (
+        <li key={m.id} className={`row ${m.from === self ? 'mine' : 'theirs'}`}>
+          <div className={`bubble ${m.from === self ? 'mine' : 'theirs'}`}>
+            <span className="who">{m.from === self ? `You · ${ROLE_LABEL[m.from]}` : ROLE_LABEL[m.from]}</span>
+            <span className="text">{m.text}</span>
+            {m.voice === 'making' && <span className="vn-wait">Making voice note…</span>}
+            {m.voiceUrl && (
+              <button type="button" className="vn" onClick={() => onReplayVoice(m)}>
+                <span className="play">▶</span>
+                <span className="wave" aria-hidden />
+                <span>Play</span>
+              </button>
             )}
+            <span className="meta">
+              <span className="when">{formatTime(m.at)}</span>
+              {m.from === 'guest' && (
+                <button type="button" className="mini" onClick={() => onReplaySign(m)}>
+                  Sign
+                </button>
+              )}
+            </span>
           </div>
-        )}
-      </div>
+        </li>
+      ))}
+      <li ref={end} className="log-end" aria-hidden />
+    </ol>
+  )
+}
 
-      <div className="mic-area">
-        <button
-          className={`mic ${listener.listening ? 'on' : ''} ${listener.speaking ? 'hearing' : ''}`}
-          onClick={listener.listening ? listener.stop : listener.start}
-          aria-pressed={listener.listening}
-          disabled={!listener.listening && health.whisper !== 'ready'}
-        >
-          <span className="mic-icon" aria-hidden>
-            🎤
-          </span>
-          {micLabel}
-        </button>
-        {listener.listening && (
-          <div className="meter" aria-hidden>
-            <span style={{ width: `${Math.round(listener.level * 100)}%` }} />
-          </div>
-        )}
-        <p className="live" aria-live="polite">
-          {listener.listening
-            ? `Mic live${listener.micLabel ? ` · ${listener.micLabel}` : ''}. Speak, then pause.`
-            : health.whisper === 'ready'
-              ? 'Speech is turned into text on this computer with Whisper.'
-              : health.whisper === 'loading'
-                ? 'Loading Whisper…'
-                : 'Start the speech server to use the microphone: npm run server'}
-        </p>
-        {listener.error && <p className="warn">{listener.error}</p>}
-      </div>
-
-      <form className="composer" onSubmit={submit}>
-        <input value={typed} onChange={(e) => setTyped(e.target.value)} placeholder="Or type your message" aria-label="Type your message" />
-        <button type="submit" disabled={!typed.trim()}>
-          Send
-        </button>
-      </form>
-
-      <div className="guest-camera">
-        <CameraControl label="guest camera" camera={cam.camera} onCamera={cam.onCamera} devices={cam.devices} />
-        {cam.cameraError && <p className="warn">{cam.cameraError}</p>}
-        <VideoPreview stream={cam.stream} className="guest-video" label="Guest camera preview" />
-        {cam.stream && <p className="note">The receptionist sees this camera next to Zuri.</p>}
-      </div>
-
-      <button className="sample" onClick={onSample} title="Sends a scripted guest line, for rehearsing the demo">
-        <span>Demo line:</span> “{nextSample}”
-      </button>
-    </section>
+function IconGear() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4" />
+    </svg>
+  )
+}
+function IconList() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M8 7h13M8 12h13M8 17h13M3 7h.01M3 12h.01M3 17h.01" />
+    </svg>
+  )
+}
+function IconCam() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <rect x="3" y="7" width="13" height="10" rx="2" />
+      <path d="M16 10l5-3v10l-5-3z" />
+    </svg>
+  )
+}
+function IconExpand() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
+    </svg>
+  )
+}
+function IconPause() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+      <rect x="7" y="6" width="3" height="12" rx="1" />
+      <rect x="14" y="6" width="3" height="12" rx="1" />
+    </svg>
+  )
+}
+function IconReplay() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M4 12a8 8 0 1 0 2-5.3M4 4v5h5" />
+    </svg>
+  )
+}
+function IconMic() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M6 11a6 6 0 0 0 12 0M12 17v4M8 21h8" fill="none" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  )
+}
+function IconEmoji() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M8 10h.01M16 10h.01M8.5 15c1.2 1.2 5.8 1.2 7 0" />
+    </svg>
+  )
+}
+function IconSend() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M4 12h14M13 6l6 6-6 6" />
+    </svg>
   )
 }

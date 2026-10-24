@@ -4,8 +4,27 @@ export interface PhraseGroup {
   phrases: string[]
 }
 
+/** The ten desk lines Zuri is taught to sign in this demo. */
+export const TOP_HOTEL_PHRASES = [
+  'Welcome! How can I help you?',
+  'Good morning, welcome to our hotel.',
+  'Do you have a reservation?',
+  'May I see your ID or passport, please?',
+  'Your room is ready.',
+  'Here is your room key.',
+  'Breakfast is served from 6:30 to 10:00 AM.',
+  'The lift is on your left.',
+  'Check-out is at 10 AM.',
+  'Enjoy your stay!',
+]
+
 /** Quick replies for the Deaf receptionist, grouped by common hospitality exchanges. */
 export const PHRASE_GROUPS: PhraseGroup[] = [
+  {
+    id: 'top10',
+    label: 'Top 10 signs',
+    phrases: TOP_HOTEL_PHRASES,
+  },
   {
     id: 'greet',
     label: 'Greeting',

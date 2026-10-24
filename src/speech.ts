@@ -1,5 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+/** Map raw browser / server failures to a short guest-facing line. */
+export function userFacingSpeechError(raw: string | null | undefined): string {
+  const msg = (raw ?? '').trim()
+  if (!msg) return 'Something went wrong with speech. You can keep typing.'
+  if (/blocked|NotAllowed/i.test(msg)) return 'Microphone access was blocked. Allow it for this site, or type instead.'
+  if (/No microphone|NotFound/i.test(msg)) return 'No microphone was found. Connect one, or type instead.'
+  if (/Failed to fetch|not running|npm run server|JSON/i.test(msg) || /\b500\b/.test(msg)) {
+    return 'Speech is offline. You can keep typing.'
+  }
+  if (/No sound|Chipset|HD Audio|Digital Microphone|no live audio/i.test(msg)) {
+    return "Microphone isn't receiving audio. Check the connection or choose another input. You can keep typing."
+  }
+  if (/secure page|HTTPS/i.test(msg)) return 'The microphone needs a secure page. You can keep typing.'
+  if (/type instead|keep typing/i.test(msg) && !/Chipset|HD Audio|Digital Microphone|DeviceId/i.test(msg)) return msg
+  return 'Something went wrong with speech. You can keep typing.'
+}
+
 export interface ServerHealth {
   whisper: 'ready' | 'loading' | 'error' | 'offline'
   model?: string
@@ -102,7 +119,7 @@ function concat(chunks: Float32Array[]): Float32Array {
 }
 
 interface ListenerOptions {
-  onFinal: (text: string) => void
+  onFinal: (text: string, wav?: Blob) => void
   onSpeechStart?: () => void
 }
 
@@ -132,15 +149,11 @@ export function useWhisperListener({ onFinal, onSpeechStart }: ListenerOptions) 
       const res = await fetch('/api/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav })
       const data = (await res.json()) as { text?: string; error?: string }
       if (!res.ok) throw new Error(data.error ?? `Server error ${res.status}`)
-      if (data.text) handlers.current.onFinal(data.text)
+      if (data.text) handlers.current.onFinal(data.text, wav)
       setError(null)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      setError(
-        msg.includes('Failed to fetch') || msg.includes('500') || msg.includes('JSON')
-          ? 'The local speech server is not running. Start it with: npm run server'
-          : msg,
-      )
+      setError(userFacingSpeechError(msg))
     } finally {
       pending.current -= 1
       if (pending.current === 0) setTranscribing(false)
@@ -158,11 +171,9 @@ export function useWhisperListener({ onFinal, onSpeechStart }: ListenerOptions) 
     } catch (e) {
       const name = e instanceof DOMException ? e.name : ''
       setError(
-        name === 'NotAllowedError'
-          ? 'Microphone access was blocked. Allow the microphone for this site, or type the guest message.'
-          : name === 'NotFoundError'
-            ? 'No microphone was found. Connect one, or type the guest message.'
-            : 'The microphone needs a secure page (localhost or HTTPS).',
+        userFacingSpeechError(
+          name === 'NotAllowedError' ? 'blocked' : name === 'NotFoundError' ? 'No microphone' : 'secure page',
+        ),
       )
       return
     }
@@ -170,7 +181,7 @@ export function useWhisperListener({ onFinal, onSpeechStart }: ListenerOptions) 
     const track = stream.getAudioTracks()[0]
     if (!track || track.readyState !== 'live') {
       stream.getTracks().forEach((t) => t.stop())
-      setError('The microphone opened, but no live audio track was found. Pick another input in the browser site settings.')
+      setError(userFacingSpeechError('no live audio'))
       return
     }
     track.enabled = true
@@ -203,9 +214,7 @@ export function useWhisperListener({ onFinal, onSpeechStart }: ListenerOptions) 
     let heardSound = false
     const watchdog = window.setTimeout(() => {
       if (!heardSound) {
-        setError(
-          `No sound from “${track.label || 'this microphone'}”. Check the system input, unmute the mic, then tap Speak again.`,
-        )
+        setError(userFacingSpeechError(`No sound from “${track.label || 'this microphone'}”.`))
       }
     }, 4000)
 

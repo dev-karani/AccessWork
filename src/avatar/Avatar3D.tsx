@@ -3,7 +3,30 @@ import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import type { HandPose, Pose, Shape } from './types'
 
-const MODEL_URL = '/models/michelle.glb'
+const MODEL_URL = '/models/zuri.glb?v=5'
+
+function findBone(root: THREE.Object3D, name: string): THREE.Object3D | null {
+  return root.getObjectByName(name) ?? root.getObjectByName(`mixamorig${name}`) ?? root.getObjectByName(`mixamorig:${name}`) ?? null
+}
+
+function requireBone(root: THREE.Object3D, name: string): THREE.Bone {
+  const b = findBone(root, name)
+  if (!b) throw new Error(`Bone ${name} not found`)
+  return b as THREE.Bone
+}
+
+function fingerTip(root: THREE.Object3D, last: THREE.Bone, name: string): THREE.Object3D {
+  const named = findBone(root, name)
+  if (named) return named
+  const child = last.children[0]
+  if (child) return child
+  const tip = new THREE.Object3D()
+  tip.name = `${last.name}_Tip`
+  const len = last.position.length() || 0.02
+  tip.position.set(len, 0, 0)
+  last.add(tip)
+  return tip
+}
 
 const FINGERS = ['Thumb', 'Index', 'Middle', 'Ring', 'Pinky'] as const
 type Finger = (typeof FINGERS)[number]
@@ -75,11 +98,7 @@ function orientAxis(bone: THREE.Bone, tip: THREE.Object3D, axisLocal: THREE.Vect
 }
 
 function buildArm(root: THREE.Object3D, side: 'Right' | 'Left'): ArmRig {
-  const get = (name: string) => {
-    const b = root.getObjectByName(`mixamorig${name}`) ?? root.getObjectByName(`mixamorig:${name}`)
-    if (!b) throw new Error(`Bone ${name} not found`)
-    return b as THREE.Bone
-  }
+  const get = (name: string) => requireBone(root, name)
   const upper = get(`${side}Arm`)
   const fore = get(`${side}ForeArm`)
   const hand = get(`${side}Hand`)
@@ -99,7 +118,7 @@ function buildArm(root: THREE.Object3D, side: 'Right' | 'Left'): ArmRig {
   const fingers = {} as Record<Finger, FingerRig>
   for (const name of FINGERS) {
     const bones = [1, 2, 3].map((i) => get(`${side}Hand${name}${i}`))
-    const tip = get(`${side}Hand${name}4`)
+    const tip = fingerTip(root, bones[2], `${side}Hand${name}4`)
     const bind = bones.map((b) => b.quaternion.clone())
     let worldAxis = s0
     if (name === 'Thumb') {
@@ -209,7 +228,7 @@ interface BodyMap {
 const ANCHORS_2D = [46, 105, 170, 207, 250, 290, 380]
 
 function buildBodyMap(model: THREE.Object3D, R: ArmRig, L: ArmRig): BodyMap {
-  const find = (n: string) => model.getObjectByName(`mixamorig${n}`) ?? model.getObjectByName(`mixamorig:${n}`)
+  const find = (n: string) => findBone(model, n)
   const reach = R.L1 + R.L2
   const y = (n: string, fallback: number) => {
     const o = find(n)
@@ -268,14 +287,17 @@ interface Avatar3DProps {
   pose: Pose
   talking: boolean
   letter: string | null
+  onStatus?: (status: 'loading' | 'ready' | 'error') => void
 }
 
 /** Zuri in 3D: a rigged Mixamo character whose arms and fingers follow the same sign poses as the 2D avatar. */
-export function Avatar3D({ pose, talking, letter }: Avatar3DProps) {
+export function Avatar3D({ pose, talking, letter, onStatus }: Avatar3DProps) {
   const mount = useRef<HTMLDivElement>(null)
   const poseRef = useRef(pose)
   const talkingRef = useRef(talking)
   const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading')
+  const onStatusRef = useRef(onStatus)
+  onStatusRef.current = onStatus
 
   useEffect(() => {
     poseRef.current = pose
@@ -283,28 +305,40 @@ export function Avatar3D({ pose, talking, letter }: Avatar3DProps) {
   }, [pose, talking])
 
   useEffect(() => {
+    onStatusRef.current?.(status)
+  }, [status])
+
+  useEffect(() => {
     const el = mount.current
     if (!el) return
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     renderer.outputColorSpace = THREE.SRGBColorSpace
     renderer.toneMapping = THREE.ACESFilmicToneMapping
+    renderer.setClearColor(0xc5ddd4, 1)
     el.appendChild(renderer.domElement)
 
     const scene = new THREE.Scene()
-    const camera = new THREE.PerspectiveCamera(26, 1, 0.05, 50)
-    scene.add(new THREE.HemisphereLight(0xfff6ea, 0x6b5a48, 1.8))
-    const key = new THREE.DirectionalLight(0xffffff, 2.4)
+    scene.background = new THREE.Color(0xc5ddd4)
+    const camera = new THREE.PerspectiveCamera(32, 1, 0.05, 50)
+    scene.add(new THREE.HemisphereLight(0xfff6ea, 0x4a6b58, 1.15))
+    const key = new THREE.DirectionalLight(0xffffff, 1.35)
     key.position.set(1.2, 2.5, 3)
     scene.add(key)
-    const fill = new THREE.DirectionalLight(0xffe2c4, 0.9)
+    const fill = new THREE.DirectionalLight(0xffe2c4, 0.55)
     fill.position.set(-2, 1, 1.5)
     scene.add(fill)
 
     let rig: Rig | null = null
+    let mixer: THREE.AnimationMixer | null = null
+    let idleAction: THREE.AnimationAction | null = null
+    let home: Array<[THREE.Object3D, THREE.Quaternion]> = []
+    let recover = 0
+    let wasSigning = false
     let frame = 0
     let disposed = false
     const started = performance.now()
+    const clock = new THREE.Clock()
 
     const resize = () => {
       const w = el.clientWidth || 300
@@ -323,28 +357,33 @@ export function Avatar3D({ pose, talking, letter }: Avatar3DProps) {
         if (disposed) return
         const model = gltf.scene
         model.traverse((o) => {
-          if ((o as THREE.Mesh).isMesh) o.frustumCulled = false
+          const mesh = o as THREE.Mesh
+          if (!mesh.isMesh) return
+          mesh.frustumCulled = false
+          const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+          mats.forEach((m) => {
+            const mat = m as THREE.MeshStandardMaterial
+            if (mat.map) mat.map.colorSpace = THREE.SRGBColorSpace
+          })
         })
         scene.add(model)
 
-        const tpose = gltf.animations.find((a) => a.name === 'TPose')
-        if (tpose) {
-          const mixer = new THREE.AnimationMixer(model)
-          mixer.clipAction(tpose).play()
+        const idle = gltf.animations.find((a) => /idle/i.test(a.name)) ?? gltf.animations[0]
+        if (idle) {
+          mixer = new THREE.AnimationMixer(model)
+          idleAction = mixer.clipAction(idle)
+          idleAction.enabled = true
+          idleAction.setLoop(THREE.LoopRepeat, Infinity)
+          idleAction.play()
           mixer.update(0)
-          const saved: Array<[THREE.Object3D, THREE.Quaternion, THREE.Vector3]> = []
-          model.traverse((o) => saved.push([o, o.quaternion.clone(), o.position.clone()]))
-          mixer.stopAllAction()
-          mixer.uncacheRoot(model)
-          saved.forEach(([o, q, p]) => {
-            o.quaternion.copy(q)
-            o.position.copy(p)
+          model.traverse((o) => {
+            if ((o as THREE.Bone).isBone) home.push([o, o.quaternion.clone()])
           })
         }
         model.updateMatrixWorld(true)
 
         try {
-          const head = (model.getObjectByName('mixamorigHead') ?? model.getObjectByName('mixamorig:Head')) as THREE.Bone | null
+          const head = findBone(model, 'Head') as THREE.Bone | null
           const R = buildArm(model, 'Right')
           const L = buildArm(model, 'Left')
           rig = { R, L, head, headBind: head?.quaternion.clone() ?? new THREE.Quaternion(), body: buildBodyMap(model, R, L) }
@@ -354,16 +393,18 @@ export function Avatar3D({ pose, talking, letter }: Avatar3DProps) {
           return
         }
 
-        const midY = (rig.R.S.y + rig.L.S.y) / 2
-        const headTop = model.getObjectByName('mixamorigHeadTop_End') ?? model.getObjectByName('mixamorig:HeadTop_End')
-        const reach = rig.R.L1 + rig.R.L2
-        const top = (headTop ? worldPos(headTop).y : midY + reach * 0.7) + reach * 0.12
-        const bottom = midY - reach * 1.0
-        const height = top - bottom
-        const center = (top + bottom) / 2
+        const box = new THREE.Box3().setFromObject(model)
+        const size = box.getSize(new THREE.Vector3())
+        const mid = box.getCenter(new THREE.Vector3())
+        const top = box.max.y + size.y * 0.06
+        const bottom = box.min.y + size.y * 0.5
+        const height = Math.max(0.4, top - bottom)
+        const centerY = (top + bottom) / 2
         const dist = height / 2 / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))
-        camera.position.set(0, center + height * 0.04, rig.R.S.z + dist * 1.05)
-        camera.lookAt(0, center, 0)
+        camera.near = 0.05
+        camera.far = 40
+        camera.position.set(mid.x, centerY, Math.max(box.max.z, mid.z) + Math.max(dist * 0.94, 1.05))
+        camera.lookAt(mid.x, centerY - height * 0.01, mid.z)
         setStatus('ready')
       },
       undefined,
@@ -377,7 +418,24 @@ export function Avatar3D({ pose, talking, letter }: Avatar3DProps) {
     const loop = () => {
       frame = requestAnimationFrame(loop)
       const t = (performance.now() - started) / 1000
-      if (rig) {
+      const dt = clock.getDelta()
+      const signing = talkingRef.current
+      if (signing) {
+        wasSigning = true
+        recover = 0
+        if (mixer) mixer.timeScale = 0
+        idleAction?.setEffectiveWeight(0)
+      } else if (wasSigning) {
+        wasSigning = false
+        recover = 0.4
+        if (mixer && idleAction) {
+          idleAction.reset()
+          idleAction.play()
+          idleAction.setEffectiveWeight(0)
+          mixer.timeScale = 0
+        }
+      }
+      if (rig && signing) {
         const p = poseRef.current
         const blend = 0.3
         for (const side of ['R', 'L'] as const) {
@@ -389,10 +447,19 @@ export function Avatar3D({ pose, talking, letter }: Avatar3DProps) {
         }
         if (rig.head) {
           const tilt = p.face === 'question' ? -0.12 : p.face === 'sad' ? 0.14 : 0
-          const nod = talkingRef.current ? Math.sin(t * 7) * 0.025 : 0
+          const nod = Math.sin(t * 7) * 0.025
           const e = new THREE.Euler(tilt + nod + Math.sin(t * 0.8) * 0.015, Math.sin(t * 0.5) * 0.06, p.face === 'question' ? 0.08 : 0)
           rig.head.quaternion.copy(rig.headBind).multiply(tmpQ.setFromEuler(e))
         }
+      } else if (recover > 0) {
+        recover = Math.max(0, recover - dt)
+        const k = 1 - recover / 0.4
+        const s = k * k * (3 - 2 * k)
+        home.forEach(([bone, q]) => bone.quaternion.slerp(q, 0.2 + s * 0.45))
+      } else if (mixer && idleAction) {
+        mixer.timeScale = 1
+        idleAction.setEffectiveWeight(1)
+        mixer.update(dt)
       }
       renderer.render(scene, camera)
     }

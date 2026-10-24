@@ -50,6 +50,8 @@ cd ../..
 npm start
 ```
 
+`npm run dev` also starts the speech server now. If you only want the UI, use `npm run ui`.
+
 App: http://localhost:5173 · speech server: http://127.0.0.1:8765
 
 If Piper is missing, the server uses `espeak-ng`. If neither is installed, the browser’s built-in voice is used.

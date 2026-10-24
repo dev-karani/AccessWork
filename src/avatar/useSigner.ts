@@ -91,8 +91,9 @@ export function useSigner() {
   )
 
   const stop = useCallback(() => {
-    run([{ pose: REST, dur: 400, hold: 0, gloss: -1, letter: null }], [])
-  }, [run])
+    cancel()
+    setState({ glosses: [], active: -1, letter: null, playing: false })
+  }, [])
 
   useEffect(() => cancel, [])
 

@@ -1,32 +1,51 @@
 :root {
-  --bg: #f3efe6;
-  --card: #fffdf8;
-  --ink: #1d2421;
-  --muted: #5d6762;
-  --line: #e2dccd;
-  --teal: #0f6b63;
-  --teal-dark: #0a4a44;
-  --teal-soft: #dcefeb;
-  --amber: #e8a92e;
-  --amber-soft: #fff1d1;
-  --coral: #c2412d;
-  --guest: #3b4fb8;
-  --guest-soft: #e6e9fb;
-  --radius: 16px;
-  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  color-scheme: only light;
+  --bg: #e4ece7;
+  --ink: #111111;
+  --muted: #6b7280;
+  --line: #d7e0db;
+  --soft: #f4f4f5;
+  --mint: #e8f3ee;
+  --teal: #0b5d4a;
+  --teal-ink: #ffffff;
+  --soon: #f3efe6;
+  --soon-ink: #8a7348;
+  --coral: #c43c2c;
+  --focus: #0b5d4a;
+  --stage: #c5ddd4;
+  --shadow: 0 10px 40px rgba(17, 17, 17, 0.06);
+  --radius: 28px;
+  --touch: 48px;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
   color: var(--ink);
   background: var(--bg);
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
 }
 
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: only light;
+    --bg: #e4ece7;
+    --ink: #111111;
+  }
+}
+
 * {
   box-sizing: border-box;
 }
 
+html,
+body,
+#root {
+  background: var(--bg);
+  color: var(--ink);
+  height: 100%;
+  min-height: 100%;
+}
+
 body {
   margin: 0;
-  min-height: 100vh;
 }
 
 h1,
@@ -38,37 +57,47 @@ p {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
   color: inherit;
 }
 
 button {
   cursor: pointer;
-  border: 1px solid var(--line);
-  background: var(--card);
-  border-radius: 10px;
-  padding: 0.5rem 0.85rem;
-  font-weight: 600;
-  transition: background 0.15s, border-color 0.15s, transform 0.05s;
-}
-
-button:hover:not(:disabled) {
-  border-color: var(--teal);
-}
-
-button:active:not(:disabled) {
-  transform: translateY(1px);
+  border: 0;
+  background: none;
 }
 
 button:disabled {
-  opacity: 0.45;
+  opacity: 0.4;
   cursor: not-allowed;
 }
 
 button:focus-visible,
 input:focus-visible,
-select:focus-visible {
-  outline: 3px solid var(--amber);
+select:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid var(--focus);
   outline-offset: 2px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

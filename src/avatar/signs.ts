@@ -57,6 +57,10 @@ export const SIGNS: Record<string, Keyframe[]> = {
     { L: m(h(140, 258, -90, 'cup')), R: h(108, 212, 125, 'flat'), dur: 360 },
     { L: m(h(140, 258, -90, 'cup')), R: h(140, 252, 150, 'flat'), dur: 360, hold: 120 },
   ],
+  'CHECK-OUT': [
+    { L: m(h(140, 258, -90, 'cup')), R: h(140, 252, 150, 'flat'), dur: 360 },
+    { L: m(h(140, 258, -90, 'cup')), R: h(108, 212, 125, 'flat'), dur: 360, hold: 120 },
+  ],
   ROOM: [
     { R: h(116, 232, 0, 'flat'), L: m(h(116, 232, 0, 'flat')), dur: 320 },
     { R: h(128, 214, -90, 'flat'), L: m(h(128, 262, -90, 'flat')), dur: 360, hold: 100 },
@@ -193,9 +197,25 @@ export const SIGNS: Record<string, Keyframe[]> = {
   ],
 }
 
+/** Whole receptionist lines signed as a planned sequence (demo library). Longer matches first. */
+export const HOTEL_SIGN_LINES: Array<[string[], string[]]> = [
+  [['welcome', 'how', 'can', 'i', 'help', 'you'], ['WELCOME', 'HELP', 'YOU']],
+  [['good', 'morning', 'welcome', 'to', 'our', 'hotel'], ['GOOD', 'MORNING', 'WELCOME']],
+  [['do', 'you', 'have', 'a', 'reservation'], ['YOU', 'HAVE', 'RESERVATION']],
+  [['may', 'i', 'see', 'your', 'id', 'or', 'passport', 'please'], ['PLEASE', 'NAME']],
+  [['your', 'room', 'is', 'ready'], ['YOU', 'ROOM', 'GOOD']],
+  [['here', 'is', 'your', 'room', 'key'], ['KEY']],
+  [['breakfast', 'is', 'served'], ['MORNING', 'EAT', 'TIME']],
+  [['the', 'lift', 'is', 'on', 'your', 'left'], ['UP', 'LEFT']],
+  [['check', 'out', 'is', 'at'], ['TIME', 'CHECK-OUT']],
+  [['enjoy', 'your', 'stay'], ['GOOD', 'BYE']],
+]
+
 /** Words and phrases mapped to one or more glosses. Multi-word phrases are matched first. */
 const PHRASES: Array<[string[], string[]]> = [
+  ...HOTEL_SIGN_LINES,
   [['thank', 'you'], ['THANK-YOU']],
+  [['check', 'out'], ['CHECK-OUT']],
   [['check', 'in'], ['CHECK-IN']],
   [['good', 'morning'], ['GOOD', 'MORNING']],
   [['how', 'much'], ['HOW', 'PAY']],
@@ -272,15 +292,28 @@ function sign(key: string): Gloss {
   return fingerspell(key)
 }
 
-/** Convert an English sentence into a sequence of glosses the avatar can perform. */
-export function textToGloss(text: string): Gloss[] {
-  const tokens = text
+function containsSeq(tokens: string[], words: string[]) {
+  for (let i = 0; i <= tokens.length - words.length; i++) {
+    if (words.every((w, j) => tokens[i + j] === w)) return true
+  }
+  return false
+}
+
+function tokenize(text: string) {
+  return text
     .toLowerCase()
     .replace(/[’']/g, '')
     .replace(/[^a-z0-9\s-]/g, ' ')
     .replace(/-/g, ' ')
     .split(/\s+/)
     .filter(Boolean)
+}
+
+/** Convert an English sentence into a sequence of glosses the avatar can perform. */
+export function textToGloss(text: string): Gloss[] {
+  const tokens = tokenize(text)
+  const hotel = HOTEL_SIGN_LINES.find(([words]) => containsSeq(tokens, words))
+  if (hotel) return hotel[1].map((g) => sign(g))
 
   const out: Gloss[] = []
   for (let i = 0; i < tokens.length; i++) {
@@ -329,6 +362,5 @@ export function toSegments(glosses: Gloss[]): Segment[] {
       segs.push({ pose: { R, L, face }, dur: kf.dur, hold: kf.hold ?? 40, gloss: gi, letter: kf.letter ?? null })
     })
   })
-  if (segs.length) segs.push({ pose: REST, dur: 520, hold: 0, gloss: -1, letter: null })
   return segs
 }
